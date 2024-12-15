@@ -5,21 +5,24 @@ import asyncio
 from abc import ABC, abstractmethod
 import json
 from typing import Any, Optional
+from weakref import proxy
 import aiohttp
 from aiohttp import ClientResponse, ClientSession, ClientTimeout, WSMsgType
 from aiohttp.client_exceptions import ServerDisconnectedError
 import traceback
 from loguru import logger as log
 
-class BaseRestCollector(ABC):
+class AsyncRest(ABC):
     """REST API采集器基类"""
     
     def __init__(
         self,
+        host: str,
         session: Optional[ClientSession] = None,
         max_retries: int = 3,
         retry_delay: float = 1.0,
-        timeout: float = 30
+        timeout: float = 30,
+        proxy=None
     ):
         """
         初始化REST采集器
@@ -36,15 +39,14 @@ class BaseRestCollector(ABC):
         self.max_retries = max_retries
         self.retry_delay = retry_delay
     
-    @abstractmethod
-    async def check_rate_limit(self) -> float:
+    async def check_rate_limit(self) :
         """
         检查频率限制，返回需要等待的时间（秒）
         
         Returns:
             float: 需要等待的时间，0表示可以立即请求
         """
-        pass
+        return 0
     
     async def _retry_request(
         self,
@@ -128,13 +130,13 @@ class BaseRestCollector(ABC):
             await self.session.close()
 
 
-class BaseWSCollector(ABC):
+class AsyncWS(ABC):
     """WebSocket采集器基类"""
-    
     def __init__(self, url: str,proxy=None):
         self.proxy = proxy
         self.url = url
         self._ws = None  # Websocket connection object.
+        self.session = None
             
     def init(self, url, connected_callback, process_callback=None, process_binary_callback=None):
         self.url = url
@@ -146,79 +148,92 @@ class BaseWSCollector(ABC):
         await self._connect()
 
     async def _connect(self):
-        session = aiohttp.ClientSession()
+        """连接到 WebSocket 服务器"""
+        self.session = aiohttp.ClientSession()
         try:
             if self.proxy:
-                self._ws = await session.ws_connect(self.url, proxy=self.proxy)
+                self._ws = await self.session.ws_connect(self.url, proxy=self.proxy)
             else:
-                self._ws = await session.ws_connect(self.url)
-                log.debug("ws connected")
-            await self.connected_callback()
-            log.debug("ws connected callback")
+                self._ws = await self.session.ws_connect(self.url)
+            log.debug("WebSocket connected successfully")
+            
+            if hasattr(self, 'connected_callback'):
+                await self.connected_callback()
+                log.debug("WebSocket connected callback executed")
+            
             await self._receive()
-            await self.on_disconnected()
-        except Exception:
-            print("ws error")
+        except Exception as e:
+            log.error(f"WebSocket connection error: {str(e)}")
             traceback.print_exc()
+            await asyncio.sleep(1)  # 添加重连延迟
             await self._check_connection()
-
-    @property
-    def ws(self):
-        return self._ws
-
-    async def on_disconnected(self):
-        log.info("connected closed.")
-        await self._check_connection()
-
-    async def _reconnect(self):
-        """Re-connect to Websocket server."""
-        log.warning("reconnecting to Websocket server right now!")
-        await self._connect()
+        finally:
+            if hasattr(self, 'session'):
+                await self.session.close()
 
     async def _receive(self):
-        """Receive stream message from Websocket connection."""
-        async for msg in self.ws:
+        """接收 WebSocket 消息"""
+        async for msg in self._ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
                 if self.process_callback:
                     try:
                         data = json.loads(msg.data)
-                    except:
+                    except json.JSONDecodeError:
                         data = msg.data
                     await self.process_callback(data)
             elif msg.type == aiohttp.WSMsgType.BINARY:
                 if self.process_binary_callback:
                     await self.process_binary_callback(msg.data)
             elif msg.type == aiohttp.WSMsgType.CLOSED:
-                log.warning("receive event CLOSED:", msg, caller=self)
+                log.warning(f"WebSocket connection closed: {msg}")
                 await self._reconnect()
             elif msg.type == aiohttp.WSMsgType.PING:
-                print(f"ping:{msg.data}")
-                await self._ws.send(WSMsgType.PONG)
+                log.debug(f"Received PING: {msg.data}")
+                await self._ws.pong(msg.data)
             elif msg.type == aiohttp.WSMsgType.ERROR:
-                log.error("receive event ERROR:", msg, caller=self)
+                log.error(f"WebSocket error occurred: {msg}")
             else:
-                log.warning("unhandled msg:", msg, caller=self)
+                log.warning(f"Unhandled WebSocket message type: {msg}")
 
     async def _check_connection(self):
-        """Check Websocket connection, if connection closed, re-connect immediately."""
+        """检查 WebSocket 连接状态，如果断开则重连"""
         if not self._ws:
-            log.warning("Websocket connection not connected yet!")
+            log.warning("WebSocket connection not established")
+            await asyncio.sleep(1)  # 添加重连延迟
+            await self._connect()
             return
+            
         if self._ws.closed:
+            log.warning("WebSocket connection closed, attempting to reconnect")
+            await asyncio.sleep(1)  # 添加重连延迟
             await self._reconnect()
 
+    async def _reconnect(self):
+        """重新连接到 WebSocket 服务器"""
+        log.info("Reconnecting to WebSocket server")
+        if self._ws and not self._ws.closed:
+            await self._ws.close()
+        await self._connect()
+
     async def send(self, data):
-        try:
-            if not self.ws:
-                log.warning("Websocket connection not connected yet!")
-                return False
-            if isinstance(data, dict):
-                await self.ws.send_json(data)
+        """发送数据到 WebSocket 服务器
+        
+        Args:
+            data: 要发送的数据
+            
+        Raises:
+            ConnectionError: WebSocket 未连接时抛出
+        """
+        if not self._ws or self._ws.closed:
+            log.warning("WebSocket not connected, attempting to connect")
+            await self._connect()
+            
+        if self._ws and not self._ws.closed:
+            if isinstance(data, (dict, list)):
+                await self._ws.send_json(data)
             elif isinstance(data, str):
-                await self.ws.send_str(data)
+                await self._ws.send_str(data)
             else:
-                return False
-            return True
-        except :
-            log.error("ws send error")
-            await self._check_connection()
+                await self._ws.send_bytes(data)
+        else:
+            raise ConnectionError("Failed to establish WebSocket connection")
